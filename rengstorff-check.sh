@@ -143,13 +143,11 @@ def extract_pdf_text(url, max_chars=3000):
         os.unlink(tmp)
         if result.returncode == 0:
             text = ' '.join(result.stdout.split())
-            # Table-of-contents pages repeat these headings with dot-leader
-            # page numbers before the real section, and report titles often
-            # repeat "Summary Report" in page headers/footers — so check
-            # 'Overview' first (marks real body text reliably) before the
-            # generic staff-report headings, which are also more prone to
-            # matching header/footer noise.
-            for section in ['Overview', 'RECOMMENDATION', 'BACKGROUND', 'PURPOSE', 'SUMMARY']:
+            # Staff memos front-load PURPOSE/BACKGROUND (concise, usable as-is).
+            # Long summary/technical reports bury it after a table of contents —
+            # for those, the LAST occurrence of a section heading is the real
+            # body text, not the TOC entry, so rfind beats find there too.
+            for section in ['PURPOSE', 'BACKGROUND', 'Overview', 'RECOMMENDATION', 'SUMMARY']:
                 idx = text.rfind(section)
                 if idx > 0:
                     return text[idx:idx+max_chars]
@@ -163,13 +161,17 @@ for m in matters:
     mid = m['MatterId']
     # Fetch attachments
     attachments = fetch_json(f"{api_base}/matters/{mid}/attachments")
-    # Find the primary staff report (prefer "Council Report" or "CTC Memo")
+    # Prefer a memo/staff report (concise, front-loaded PURPOSE/BACKGROUND)
+    # over a generic "summary report" (long technical doc, buried findings).
     pdf_url = None
-    for att in attachments:
-        name = (att.get('MatterAttachmentName') or '').lower()
-        url = att.get('MatterAttachmentHyperlink') or ''
-        if url.endswith('.pdf') and any(k in name for k in ['council report', 'ctc memo', 'staff report', 'memo']):
-            pdf_url = url
+    for priority in (['memo', 'staff report', 'council report', 'ctc memo'], ['summary report']):
+        for att in attachments:
+            name = (att.get('MatterAttachmentName') or '').lower()
+            url = att.get('MatterAttachmentHyperlink') or ''
+            if url.endswith('.pdf') and any(k in name for k in priority):
+                pdf_url = url
+                break
+        if pdf_url:
             break
     if not pdf_url and attachments:
         # Fall back to first PDF
@@ -211,11 +213,7 @@ for m in sorted(matters, key=lambda x: x.get('MatterAgendaDate', '') or ''):
     body = m.get('MatterBodyName', '')
     mtype = m.get('MatterTypeName', '')
     status = m.get('MatterStatusName', '')
-    mid = m.get('MatterId')
-    guid = m.get('MatterGuid')
     file_no = m.get('MatterFile', '')
-    detail_url = f"{legistar_web}/LegislationDetail.aspx?ID={mid}&GUID={guid}" if mid and guid else None
-    date_str = f'<a href="{detail_url}" target="_blank">{agenda} ↗</a>' if detail_url else agenda
 
     pdf_snippet = (m.get('_pdf_text') or '').strip()[:600].replace('<', '&lt;').replace('>', '&gt;')
     pdf_link = m.get('_pdf_url', '')
@@ -224,9 +222,19 @@ for m in sorted(matters, key=lambda x: x.get('MatterAgendaDate', '') or ''):
         pdf_section += f' <a href="{pdf_link}" target="_blank">[full report]</a>'
     pdf_section += '</div>'
 
+    # NOTE: the Legistar Web API's MatterId/MatterGuid do NOT match the
+    # internal IDs LegislationDetail.aspx expects on the public site (verified
+    # by hand: API gives MatterId=8755 for file #204338, but the site's own
+    # detail link for that same file is ID=7145968 — a different,
+    # undocumented ID with no API-exposed mapping). A constructed deep link
+    # 404s ("Invalid parameters"), so we link to the general search page
+    # instead — not pre-filled, but real and working.
+    search_url = f"{legistar_web}/Legislation.aspx"
+    pdf_section += f' <div class="links"><a href="{search_url}" target="_blank">Search Legistar for file #{file_no} ↗</a></div>'
+
     rows += f"""
     <li>
-      <div class="date">{date_str} — {body}</div>
+      <div class="date">{agenda} — {body}</div>
       <div><strong>{title}</strong></div>
       <div class="body">Type: {mtype} &nbsp;|&nbsp; Status: {status} &nbsp;|&nbsp; Legistar #{file_no}</div>
       {pdf_section}
