@@ -335,13 +335,13 @@ with open(index, 'w') as f: f.write(content)
 print('Index updated.')
 "
 
-# ── 9. Commit and push ────────────────────────────────────────────────────────
+# ── 9. Update state ────────────────────────────────────────────────────────────
+python3 -c "import json; json.dump({'last_check': '$(date -u +%Y-%m-%dT%H:%M:%S)', 'last_post': '$TODAY', 'last_count': $COUNT}, open('$STATE_FILE','w'))"
+
+# ── 10. Commit and push ────────────────────────────────────────────────────────
 cd "$REPO_DIR"
 git add -A
 git commit -m "Auto-update: ${COUNT} new Rengstorff matter(s) — ${TODAY}"
 git push origin main
 log "Pushed to GitHub."
-
-# ── 10. Update state ──────────────────────────────────────────────────────────
-python3 -c "import json; json.dump({'last_check': '$(date -u +%Y-%m-%dT%H:%M:%S)', 'last_post': '$TODAY', 'last_count': $COUNT}, open('$STATE_FILE','w'))"
 log "Done."
