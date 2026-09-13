@@ -102,6 +102,12 @@ json.dump(s, open('$STATE_FILE','w'))
 "
     echo "✅ Rengstorff grade separation weekly check: no new matters. Everything is working."
   fi
+  git add -A
+  if ! git diff --cached --quiet; then
+    git commit -m "chore: monitor check - no updates"
+    git push origin main
+    log "Pushed state update."
+  fi
   exit 0
 fi
 
