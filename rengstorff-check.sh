@@ -6,7 +6,8 @@
 #   1. Queries Legistar API for matters modified since last run
 #   2. Filters to Rengstorff-specific grade separation items only
 #   3. For each new matter, fetches staff report PDF and extracts text
-#   4. Uses headless browser (Playwright) to get the correct MeetingDetail URL
+#   4. Builds a Legistar deep link directly from MatterId+MatterGuid
+#      (LegislationDetail.aspx?ID=<id>&GUID=<guid> — no scraping needed)
 #   5. Generates an HTML blog post and pushes to GitHub Pages
 
 set -euo pipefail
@@ -15,8 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$SCRIPT_DIR"
 STATE_FILE="$SCRIPT_DIR/rengstorff-state.json"
 LEGISTAR_API="https://webapi.legistar.com/v1/mountainview"
-NODE_PATH_EXTRA="/home/openclaw/.npm/_npx/e41f203b7505f1fb/node_modules"
-CHROME="/home/openclaw/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell"
+LEGISTAR_WEB="https://mountainview.legistar.com"
 TODAY=$(date -u +%Y-%m-%d)
 LOG_PREFIX="[rengstorff-check $(date -u +%H:%M:%S)]"
 
@@ -120,31 +120,35 @@ api_base = "https://webapi.legistar.com/v1/mountainview"
 
 def fetch_json(url):
     try:
-        with urllib.request.urlopen(url, timeout=15) as r:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
-    except Exception as e:
+    except Exception:
         return []
 
 def extract_pdf_text(url, max_chars=3000):
     try:
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
             tmp = f.name
-        with urllib.request.urlopen(url, timeout=30) as r:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=30) as r:
             with open(tmp, 'wb') as f:
                 f.write(r.read())
         result = subprocess.run(['pdftotext', tmp, '-'], capture_output=True, text=True, timeout=30)
         os.unlink(tmp)
         if result.returncode == 0:
-            # Return first max_chars chars of meaningful content
-            text = result.stdout
-            # Skip past the header/title area, focus on RECOMMENDATION + BACKGROUND
-            for section in ['RECOMMENDATION', 'BACKGROUND', 'SUMMARY', 'PURPOSE']:
-                idx = text.find(section)
+            text = ' '.join(result.stdout.split())
+            # Table-of-contents pages repeat these headings with dot-leader
+            # page numbers before the real section — the LAST occurrence is
+            # the actual body text, not the TOC entry.
+            for section in ['RECOMMENDATION', 'BACKGROUND', 'SUMMARY', 'PURPOSE', 'Overview']:
+                idx = text.rfind(section)
                 if idx > 0:
                     return text[idx:idx+max_chars]
             return text[:max_chars]
     except Exception as e:
         return f"(PDF extraction failed: {e})"
+    return ""
 
 enriched = []
 for m in matters:
@@ -175,101 +179,35 @@ print(json.dumps(enriched))
 PYEOF
 )
 
-# ── 6. Get MeetingDetail URLs via headless browser ────────────────────────────
-log "Fetching meeting detail URLs via headless browser ..."
-MEETING_URLS=$(echo "$ENRICHED" | python3 -c "
-import json, sys
-matters = json.load(sys.stdin)
-for m in matters:
-    agenda = (m.get('MatterAgendaDate') or '').split('T')[0]
-    body = m.get('MatterBodyName','')
-    print(f\"{m['MatterId']}|{agenda}|{body}\")
-" | while IFS='|' read -r mid date body; do
-  if [[ -z "$date" ]]; then
-    echo "$mid|null"
-    continue
-  fi
-  year="${date%%-*}"
-  month="${date#*-}"; month="${month%%-*}"; month="${month#0}"
-  day="${date##*-}"; day="${day#0}"
-  date_str="${month}/${day}/${year%%-*}"
-  # Use node + playwright to scrape the calendar
-  URL=$(NODE_PATH="$NODE_PATH_EXTRA" node - "$year" "$date_str" "$body" "$CHROME" <<'JSEOF' 2>/dev/null
-const [,, year, dateStr, body, chrome] = process.argv;
-const { chromium } = require('playwright');
-(async () => {
-  let browser;
-  try {
-    browser = await chromium.launch({ args: ['--no-sandbox'], executablePath: chrome });
-    const page = await browser.newPage();
-    await page.goto(`https://mountainview.legistar.com/Calendar.aspx`, { waitUntil: 'networkidle', timeout: 20000 });
-    // Select year
-    await page.click('#ctl00_ContentPlaceHolder1_lstYears_Input');
-    await page.waitForTimeout(400);
-    const yearItems = await page.$$('.rcbList li');
-    for (const li of yearItems) {
-      if ((await li.textContent()).trim() === year) { await li.click(); break; }
-    }
-    await page.waitForTimeout(2000);
-    // Select body
-    await page.click('#ctl00_ContentPlaceHolder1_lstBodies_Input');
-    await page.waitForTimeout(400);
-    const bodyItems = await page.$$('.rcbList li');
-    for (const li of bodyItems) {
-      if ((await li.textContent()).trim() === body) { await li.click(); break; }
-    }
-    await page.waitForTimeout(2000);
-    // Find link
-    const href = await page.evaluate((ds) => {
-      for (const row of document.querySelectorAll('tr')) {
-        if (row.innerText.includes(ds)) {
-          const a = row.querySelector('a[href*="MeetingDetail"]');
-          if (a) return a.href;
-        }
-      }
-      return null;
-    }, dateStr);
-    console.log(href || 'null');
-  } catch(e) { console.log('null'); }
-  finally { if (browser) await browser.close(); }
-})();
-JSEOF
-  )
-  echo "$mid|${URL:-null}"
-done)
-
-# ── 7. Generate blog post HTML ────────────────────────────────────────────────
+# ── 6. Generate blog post HTML ────────────────────────────────────────────────
+# Deep links use Legistar's public LegislationDetail.aspx?ID=<MatterId>&GUID=<MatterGuid>
+# pattern directly — no headless-browser scraping needed.
 POST_SLUG="${TODAY}-update"
 POST_FILE="$REPO_DIR/posts/${POST_SLUG}.html"
 
-python3 - <<PYEOF
+python3 - "$ENRICHED" "$TODAY" "$POST_FILE" "$LEGISTAR_WEB" <<'PYEOF'
 import json, sys
 
-matters = json.loads('''$ENRICHED'''.replace("'", "'"))
-meeting_urls = {}
-for line in """$MEETING_URLS""".strip().split('\n'):
-    if '|' in line:
-        mid_str, url = line.split('|', 1)
-        try: meeting_urls[int(mid_str)] = url.strip() if url.strip() != 'null' else None
-        except: pass
-
-today = "$TODAY"
+matters = json.loads(sys.argv[1])
+today = sys.argv[2]
+post_file = sys.argv[3]
+legistar_web = sys.argv[4]
 rows = ""
-for m in sorted(matters, key=lambda x: x.get('MatterAgendaDate','') or ''):
-    title = (m.get('MatterTitle') or '').replace('<','&lt;').replace('>','&gt;')
+for m in sorted(matters, key=lambda x: x.get('MatterAgendaDate', '') or ''):
+    title = (m.get('MatterTitle') or '').replace('<', '&lt;').replace('>', '&gt;')
     agenda = (m.get('MatterAgendaDate') or '').split('T')[0]
-    body = m.get('MatterBodyName','')
-    mtype = m.get('MatterTypeName','')
-    status = m.get('MatterStatusName','')
+    body = m.get('MatterBodyName', '')
+    mtype = m.get('MatterTypeName', '')
+    status = m.get('MatterStatusName', '')
     mid = m.get('MatterId')
-    file_no = m.get('MatterFile','')
-    meeting_url = meeting_urls.get(mid)
-    date_str = f'<a href="{meeting_url}" target="_blank">{agenda} ↗</a>' if meeting_url else agenda
+    guid = m.get('MatterGuid')
+    file_no = m.get('MatterFile', '')
+    detail_url = f"{legistar_web}/LegislationDetail.aspx?ID={mid}&GUID={guid}" if mid and guid else None
+    date_str = f'<a href="{detail_url}" target="_blank">{agenda} ↗</a>' if detail_url else agenda
 
-    # Summarize PDF text (first 600 chars of RECOMMENDATION/BACKGROUND)
-    pdf_snippet = (m.get('_pdf_text') or '').strip()[:600].replace('<','&lt;').replace('>','&gt;')
-    pdf_link = m.get('_pdf_url','')
-    pdf_section = f'<div class="detail">{pdf_snippet}{"..." if len(pdf_snippet)==600 else ""}'
+    pdf_snippet = (m.get('_pdf_text') or '').strip()[:600].replace('<', '&lt;').replace('>', '&gt;')
+    pdf_link = m.get('_pdf_url', '')
+    pdf_section = f'<div class="detail">{pdf_snippet}{"..." if len(pdf_snippet) == 600 else ""}'
     if pdf_link:
         pdf_section += f' <a href="{pdf_link}" target="_blank">[full report]</a>'
     pdf_section += '</div>'
@@ -315,30 +253,33 @@ html = f"""<!DOCTYPE html>
 </body>
 </html>"""
 
-with open("$POST_FILE", "w") as f:
+with open(post_file, "w") as f:
     f.write(html)
-print(f"Post written: $POST_FILE")
+print(f"Post written: {post_file}")
 PYEOF
 
-# ── 8. Update index.html ───────────────────────────────────────────────────────
+# ── 7. Update index.html (idempotent — skip if this slug is already listed) ──
 python3 -c "
-import re
 index = '$REPO_DIR/index.html'
+slug = '${POST_SLUG}'
 with open(index) as f: content = f.read()
-entry = '''    <li>
+if f'posts/{slug}.html' in content:
+    print('Index already has this post, skipping insert.')
+else:
+    entry = '''    <li>
       <span class=\"date\">$TODAY</span><br>
-      <a href=\"posts/${POST_SLUG}.html\">Rengstorff Update &mdash; $TODAY</a>
+      <a href=\"posts/{slug}.html\">Rengstorff Update &mdash; $TODAY</a>
     </li>
-    '''
-content = content.replace('<ul class=\"post-list\">\n', '<ul class=\"post-list\">\n' + entry, 1)
-with open(index, 'w') as f: f.write(content)
-print('Index updated.')
+    '''.format(slug=slug)
+    content = content.replace('<ul class=\"post-list\">\n', '<ul class=\"post-list\">\n' + entry, 1)
+    with open(index, 'w') as f: f.write(content)
+    print('Index updated.')
 "
 
-# ── 9. Update state ────────────────────────────────────────────────────────────
+# ── 8. Update state ────────────────────────────────────────────────────────────
 python3 -c "import json; json.dump({'last_check': '$(date -u +%Y-%m-%dT%H:%M:%S)', 'last_post': '$TODAY', 'last_count': $COUNT}, open('$STATE_FILE','w'))"
 
-# ── 10. Commit and push ────────────────────────────────────────────────────────
+# ── 9. Commit and push ────────────────────────────────────────────────────────
 cd "$REPO_DIR"
 git add -A
 git commit -m "Auto-update: ${COUNT} new Rengstorff matter(s) — ${TODAY}"
