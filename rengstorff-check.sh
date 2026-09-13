@@ -112,10 +112,15 @@ json.dump(s, open('$STATE_FILE','w'))
 fi
 
 # ── 5. For each matter: get attachments, download PDFs, extract text ──────────
-ENRICHED=$(echo "$NEW_MATTERS" | python3 - <<'PYEOF'
+NEW_MATTERS_FILE=$(mktemp)
+trap 'rm -f "$NEW_MATTERS_FILE"' EXIT
+echo "$NEW_MATTERS" > "$NEW_MATTERS_FILE"
+
+ENRICHED=$(python3 - "$NEW_MATTERS_FILE" <<'PYEOF'
 import json, sys, subprocess, tempfile, os, urllib.request
 
-matters = json.load(sys.stdin)
+with open(sys.argv[1]) as f:
+    matters = json.load(f)
 api_base = "https://webapi.legistar.com/v1/mountainview"
 
 def fetch_json(url):
@@ -139,9 +144,12 @@ def extract_pdf_text(url, max_chars=3000):
         if result.returncode == 0:
             text = ' '.join(result.stdout.split())
             # Table-of-contents pages repeat these headings with dot-leader
-            # page numbers before the real section — the LAST occurrence is
-            # the actual body text, not the TOC entry.
-            for section in ['RECOMMENDATION', 'BACKGROUND', 'SUMMARY', 'PURPOSE', 'Overview']:
+            # page numbers before the real section, and report titles often
+            # repeat "Summary Report" in page headers/footers — so check
+            # 'Overview' first (marks real body text reliably) before the
+            # generic staff-report headings, which are also more prone to
+            # matching header/footer noise.
+            for section in ['Overview', 'RECOMMENDATION', 'BACKGROUND', 'PURPOSE', 'SUMMARY']:
                 idx = text.rfind(section)
                 if idx > 0:
                     return text[idx:idx+max_chars]
@@ -184,11 +192,15 @@ PYEOF
 # pattern directly — no headless-browser scraping needed.
 POST_SLUG="${TODAY}-update"
 POST_FILE="$REPO_DIR/posts/${POST_SLUG}.html"
+ENRICHED_FILE=$(mktemp)
+trap 'rm -f "$NEW_MATTERS_FILE" "$ENRICHED_FILE"' EXIT
+echo "$ENRICHED" > "$ENRICHED_FILE"
 
-python3 - "$ENRICHED" "$TODAY" "$POST_FILE" "$LEGISTAR_WEB" <<'PYEOF'
+python3 - "$ENRICHED_FILE" "$TODAY" "$POST_FILE" "$LEGISTAR_WEB" <<'PYEOF'
 import json, sys
 
-matters = json.loads(sys.argv[1])
+with open(sys.argv[1]) as f:
+    matters = json.load(f)
 today = sys.argv[2]
 post_file = sys.argv[3]
 legistar_web = sys.argv[4]
@@ -260,12 +272,16 @@ PYEOF
 
 # ── 7. Update index.html (idempotent — skip if this slug is already listed) ──
 python3 -c "
+import re
 index = '$REPO_DIR/index.html'
 slug = '${POST_SLUG}'
 with open(index) as f: content = f.read()
 if f'posts/{slug}.html' in content:
     print('Index already has this post, skipping insert.')
 else:
+    content = re.sub(
+        r'\s*<li>\s*<span class=\"date\">&mdash;</span><br>\s*<em>No updates yet[^<]*</em>\s*</li>',
+        '', content)
     entry = '''    <li>
       <span class=\"date\">$TODAY</span><br>
       <a href=\"posts/{slug}.html\">Rengstorff Update &mdash; $TODAY</a>
